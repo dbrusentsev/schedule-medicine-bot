@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>История приёмов</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root {
+            --tg-theme-bg-color: #ffffff;
+            --tg-theme-text-color: #000000;
+            --tg-theme-hint-color: #999999;
+            --tg-theme-button-color: #3390ec;
+            --tg-theme-button-text-color: #ffffff;
+            --tg-theme-secondary-bg-color: #f4f4f5;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--tg-theme-bg-color);
+            color: var(--tg-theme-text-color);
+            padding: 16px;
+            min-height: 100vh;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .header .subtitle {
+            color: var(--tg-theme-hint-color);
+            font-size: 14px;
+        }
+
+        .calendar {
+            background: var(--tg-theme-secondary-bg-color);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+
+        .calendar-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .calendar-header h2 {
+            font-size: 17px;
+            font-weight: 600;
+        }
+
+        .calendar-nav {
+            display: flex;
+            gap: 8px;
+        }
+
+        .calendar-nav button {
+            width: 32px;
+            height: 32px;
+            border: none;
+            border-radius: 50%;
+            background: var(--tg-theme-button-color);
+            color: var(--tg-theme-button-text-color);
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        .weekdays {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            text-align: center;
+            margin-bottom: 8px;
+        }
+
+        .weekdays span {
+            font-size: 12px;
+            color: var(--tg-theme-hint-color);
+            font-weight: 500;
+        }
+
+        .days {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 4px;
+        }
+
+        .day {
+            aspect-ratio: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            border-radius: 50%;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .day.empty {
+            cursor: default;
+        }
+
+        .day.today {
+            background: var(--tg-theme-button-color);
+            color: var(--tg-theme-button-text-color);
+            font-weight: 600;
+        }
+
+        .day.has-doses::after {
+            content: '';
+            position: absolute;
+            bottom: 2px;
+            width: 6px;
+            height: 6px;
+            background: #34c759;
+            border-radius: 50%;
+        }
+
+        .day.partial::after {
+            background: #ff9500;
+        }
+
+        .day.missed::after {
+            background: #ff3b30;
+        }
+
+        .stats {
+            background: var(--tg-theme-secondary-bg-color);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+
+        .stats h3 {
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(0,0,0,0.05);
+        }
+
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            color: var(--tg-theme-hint-color);
+            font-size: 14px;
+        }
+
+        .stat-value {
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .stat-value.good { color: #34c759; }
+        .stat-value.warning { color: #ff9500; }
+        .stat-value.bad { color: #ff3b30; }
+
+        .reminders {
+            background: var(--tg-theme-secondary-bg-color);
+            border-radius: 16px;
+            padding: 16px;
+        }
+
+        .reminders h3 {
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+
+        .reminder-item {
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            background: var(--tg-theme-bg-color);
+            border-radius: 12px;
+            margin-bottom: 8px;
+        }
+
+        .reminder-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .reminder-icon {
+            font-size: 24px;
+            margin-right: 12px;
+        }
+
+        .reminder-info {
+            flex: 1;
+        }
+
+        .reminder-name {
+            font-weight: 500;
+            font-size: 15px;
+            margin-bottom: 2px;
+        }
+
+        .reminder-time {
+            color: var(--tg-theme-hint-color);
+            font-size: 13px;
+        }
+
+        .reminder-progress {
+            text-align: right;
+        }
+
+        .reminder-count {
+            font-weight: 600;
+            font-size: 15px;
+        }
+
+        .reminder-label {
+            color: var(--tg-theme-hint-color);
+            font-size: 12px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--tg-theme-hint-color);
+        }
+
+        .empty {
+            text-align: center;
+            padding: 40px;
+            color: var(--tg-theme-hint-color);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>История приёмов</h1>
+        <div class="subtitle" id="userName"></div>
+    </div>
+
+    <div class="calendar">
+        <div class="calendar-header">
+            <h2 id="monthYear"></h2>
+            <div class="calendar-nav">
+                <button onclick="prevMonth()">&lt;</button>
+                <button onclick="nextMonth()">&gt;</button>
+            </div>
+        </div>
+        <div class="weekdays">
+            <span>Пн</span>
+            <span>Вт</span>
+            <span>Ср</span>
+            <span>Чт</span>
+            <span>Пт</span>
+            <span>Сб</span>
+            <span>Вс</span>
+        </div>
+        <div class="days" id="calendarDays"></div>
+    </div>
+
+    <div class="stats">
+        <h3>Статистика за месяц</h3>
+        <div class="stat-row">
+            <span class="stat-label">Принято доз</span>
+            <span class="stat-value" id="totalDoses">—</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Дней с приёмами</span>
+            <span class="stat-value" id="daysWithDoses">—</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Adherence</span>
+            <span class="stat-value" id="adherence">—</span>
+        </div>
+    </div>
+
+    <div class="reminders">
+        <h3>Мои напоминания</h3>
+        <div id="remindersList">
+            <div class="loading">Загрузка...</div>
+        </div>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+
+        // Применяем тему Telegram
+        document.documentElement.style.setProperty('--tg-theme-bg-color', tg.themeParams.bg_color || '#ffffff');
+        document.documentElement.style.setProperty('--tg-theme-text-color', tg.themeParams.text_color || '#000000');
+        document.documentElement.style.setProperty('--tg-theme-hint-color', tg.themeParams.hint_color || '#999999');
+        document.documentElement.style.setProperty('--tg-theme-button-color', tg.themeParams.button_color || '#3390ec');
+        document.documentElement.style.setProperty('--tg-theme-button-text-color', tg.themeParams.button_text_color || '#ffffff');
+        document.documentElement.style.setProperty('--tg-theme-secondary-bg-color', tg.themeParams.secondary_bg_color || '#f4f4f5');
+
+        // Показываем имя пользователя
+        if (tg.initDataUnsafe.user) {
+            document.getElementById('userName').textContent = tg.initDataUnsafe.user.first_name;
+        }
+
+        let currentDate = new Date();
+        let remindersData = [];
+
+        const months = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                       'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+
+        function renderCalendar() {
+            const year = currentDate.getFullYear();
+            const month = currentDate.getMonth();
+
+            document.getElementById('monthYear').textContent = `${months[month]} ${year}`;
+
+            const firstDay = new Date(year, month, 1);
+            const lastDay = new Date(year, month + 1, 0);
+            const startDay = (firstDay.getDay() + 6) % 7; // Понедельник = 0
+
+            const today = new Date();
+            const isCurrentMonth = today.getFullYear() === year && today.getMonth() === month;
+
+            let html = '';
+
+            // Пустые ячейки до первого дня
+            for (let i = 0; i < startDay; i++) {
+                html += '<div class="day empty"></div>';
+            }
+
+            // Дни месяца
+            for (let day = 1; day <= lastDay.getDate(); day++) {
+                const isToday = isCurrentMonth && today.getDate() === day;
+                let classes = 'day';
+                if (isToday) classes += ' today';
+
+                // Здесь можно добавить логику для отображения приёмов
+                // classes += ' has-doses'; // если все приёмы
+                // classes += ' partial';   // если частично
+                // classes += ' missed';    // если пропущено
+
+                html += `<div class="${classes}">${day}</div>`;
+            }
+
+            document.getElementById('calendarDays').innerHTML = html;
+        }
+
+        function prevMonth() {
+            currentDate.setMonth(currentDate.getMonth() - 1);
+            renderCalendar();
+        }
+
+        function nextMonth() {
+            currentDate.setMonth(currentDate.getMonth() + 1);
+            renderCalendar();
+        }
+
+        function renderReminders(reminders) {
+            const container = document.getElementById('remindersList');
+
+            if (!reminders || reminders.length === 0) {
+                container.innerHTML = '<div class="empty">Нет напоминаний</div>';
+                return;
+            }
+
+            let html = '';
+            reminders.forEach(r => {
+                const progress = r.course_days === 0
+                    ? `${r.doses_taken}/∞`
+                    : `${r.doses_taken}/${r.course_days}`;
+
+                html += `
+                    <div class="reminder-item">
+                        <div class="reminder-icon">💊</div>
+                        <div class="reminder-info">
+                            <div class="reminder-name">${r.medicine}</div>
+                            <div class="reminder-time">${r.time}</div>
+                        </div>
+                        <div class="reminder-progress">
+                            <div class="reminder-count">${progress}</div>
+                            <div class="reminder-label">приёмов</div>
+                        </div>
+                    </div>
+                `;
+            });
+
+            container.innerHTML = html;
+        }
+
+        function updateStats(reminders) {
+            let totalDoses = 0;
+            reminders.forEach(r => totalDoses += r.doses_taken);
+
+            document.getElementById('totalDoses').textContent = totalDoses;
+            document.getElementById('daysWithDoses').textContent = '—';
+            document.getElementById('adherence').textContent = '—';
+        }
+
+        async function loadData() {
+            try {
+                const response = await fetch('/api/reminders', {
+                    headers: {
+                        'X-Telegram-Init-Data': tg.initData
+                    }
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    remindersData = data.reminders || [];
+                    renderReminders(remindersData);
+                    updateStats(remindersData);
+                } else {
+                    document.getElementById('remindersList').innerHTML =
+                        '<div class="empty">Ошибка загрузки</div>';
+                }
+            } catch (e) {
+                console.error('Failed to load data:', e);
+                // Демо данные для тестирования
+                remindersData = [
+                    { medicine: 'Витамин D', time: '09:00', doses_taken: 5, course_days: 30 },
+                    { medicine: 'Омега-3', time: '12:00', doses_taken: 12, course_days: 0 }
+                ];
+                renderReminders(remindersData);
+                updateStats(remindersData);
+            }
+        }
+
+        // Инициализация
+        renderCalendar();
+        loadData();
+    </script>
+</body>
+</html>

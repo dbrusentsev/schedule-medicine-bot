@@ -18,6 +18,11 @@ FROM alpine:3.20
 
 RUN apk add --no-cache tzdata ca-certificates
 
-COPY --from=builder /app/scheldue-bot /bot
+WORKDIR /app
 
-CMD ["/bot"]
+COPY --from=builder /app/scheldue-bot /app/bot
+COPY web /app/web
+
+EXPOSE 8080
+
+CMD ["/app/bot"]

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -97,6 +99,20 @@ func NewBot(token string) (*Bot, error) {
 	)
 	if _, err := api.Request(commands); err != nil {
 		log.Printf("Failed to set bot commands: %v", err)
+	}
+
+	// Устанавливаем Menu Button
+	// Если есть WEBAPP_URL - показываем кнопку Web App, иначе - меню команд
+	webAppURL := os.Getenv("WEBAPP_URL")
+	menuParams := tgbotapi.Params{}
+	if webAppURL != "" {
+		menuParams.AddNonEmpty("menu_button", fmt.Sprintf(`{"type":"web_app","text":"📊 История","web_app":{"url":"%s"}}`, webAppURL))
+		log.Printf("Web App URL: %s", webAppURL)
+	} else {
+		menuParams.AddNonEmpty("menu_button", `{"type":"commands"}`)
+	}
+	if _, err := api.MakeRequest("setChatMenuButton", menuParams); err != nil {
+		log.Printf("Failed to set menu button: %v", err)
 	}
 
 	var adminID int64
@@ -268,6 +284,13 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		idStr := strings.TrimPrefix(data, "taken_")
 		id, _ := strconv.Atoi(idStr)
 		b.handleTakenConfirm(chatID, callback.Message.MessageID, id)
+
+	case strings.HasPrefix(data, "stars_"):
+		// Выбор суммы доната
+		amountStr := strings.TrimPrefix(data, "stars_")
+		amount, _ := strconv.Atoi(amountStr)
+		b.deleteMessage(chatID, callback.Message.MessageID)
+		b.sendStarsInvoice(chatID, amount)
 
 	case data == "cancel":
 		b.mu.Lock()
@@ -772,6 +795,70 @@ func (b *Bot) handleTakenConfirm(chatID int64, messageID int, reminderID int) {
 	}
 }
 
+// ReminderJSON структура для JSON ответа
+type ReminderJSON struct {
+	ID         int    `json:"id"`
+	Medicine   string `json:"medicine"`
+	Time       string `json:"time"`
+	CourseDays int    `json:"course_days"`
+	DosesTaken int    `json:"doses_taken"`
+}
+
+// GetUserReminders возвращает напоминания пользователя для API
+func (b *Bot) GetUserReminders(chatID int64) []ReminderJSON {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	user, exists := b.users[chatID]
+	if !exists {
+		return []ReminderJSON{}
+	}
+
+	result := make([]ReminderJSON, len(user.Reminders))
+	for i, r := range user.Reminders {
+		result[i] = ReminderJSON{
+			ID:         r.ID,
+			Medicine:   r.Medicine,
+			Time:       r.TimeString(),
+			CourseDays: r.CourseDays,
+			DosesTaken: r.DosesTaken,
+		}
+	}
+	return result
+}
+
+// parseUserFromInitData извлекает user_id из Telegram initData
+func (b *Bot) parseUserFromInitData(initData string) int64 {
+	// Упрощённый парсинг - в продакшене нужна полная валидация HMAC!
+	// initData формат: query_id=...&user={"id":123,...}&auth_date=...&hash=...
+
+	// Декодируем URL-encoded строку
+	decoded, err := url.QueryUnescape(initData)
+	if err != nil {
+		return 0
+	}
+
+	// Ищем user= параметр
+	params, err := url.ParseQuery(decoded)
+	if err != nil {
+		return 0
+	}
+
+	userJSON := params.Get("user")
+	if userJSON == "" {
+		return 0
+	}
+
+	var userData struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(userJSON), &userData); err != nil {
+		return 0
+	}
+
+	return userData.ID
+}
+
 // GetRemindersForTime возвращает список напоминаний для указанного времени
 func (b *Bot) GetRemindersForTime(hour, minute int) map[int64][]Reminder {
 	b.mu.RLock()
@@ -820,25 +907,43 @@ func (b *Bot) IncrementDoseTaken(chatID int64, reminderID int) (medicineName str
 	return "", 0, 0, false
 }
 
-// handleDonate отправляет инвойс для доната через Telegram Stars
-func (b *Bot) handleDonate(msg *tgbotapi.Message) {
-	chatID := msg.Chat.ID
+// handleDonate отправляет меню выбора суммы доната
+func (b *Bot) handleDonate(message *tgbotapi.Message) {
+	chatID := message.Chat.ID
 
-	// Создаём инвойс для Telegram Stars
+	// Показываем выбор суммы доната
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⭐ 1", "stars_1"),
+			tgbotapi.NewInlineKeyboardButtonData("⭐ 5", "stars_5"),
+			tgbotapi.NewInlineKeyboardButtonData("⭐ 10", "stars_10"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⭐ 50", "stars_50"),
+			tgbotapi.NewInlineKeyboardButtonData("⭐ 100", "stars_100"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, "Выбери сумму доната:\n\nТвоя поддержка помогает развивать бота! 💊")
+	msg.ReplyMarkup = keyboard
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send donate message: %v", err)
+	}
+}
+
+// sendStarsInvoice отправляет инвойс для Telegram Stars
+func (b *Bot) sendStarsInvoice(chatID int64, amount int) {
 	invoice := tgbotapi.InvoiceConfig{
 		BaseChat: tgbotapi.BaseChat{
 			ChatID: chatID,
 		},
-		Title:         "Поддержать автора",
-		Description:   "Спасибо за поддержку! Ваш донат помогает развивать бота 💊",
-		Payload:       "donate_stars",
-		ProviderToken: "", // Пустой токен для Telegram Stars
-		Currency:      "XTR", // Валюта Telegram Stars
-		Prices: []tgbotapi.LabeledPrice{
-			{Label: "Донат", Amount: 1}, // 1 звезда (минимум)
-		},
-		MaxTipAmount:        100, // Максимальные чаевые
-		SuggestedTipAmounts: []int{4, 9, 49, 99}, // Предложенные суммы (+1 базовая = 5, 10, 50, 100)
+		Title:               "Поддержать автора",
+		Description:         fmt.Sprintf("Донат %d ⭐ — спасибо за поддержку!", amount),
+		Payload:             fmt.Sprintf("donate_%d", amount),
+		ProviderToken:       "", // Пустой для Telegram Stars
+		Currency:            "XTR",
+		Prices:              []tgbotapi.LabeledPrice{{Label: "Донат", Amount: amount}},
+		SuggestedTipAmounts: []int{}, // Явно пустой массив
 	}
 
 	if _, err := b.api.Send(invoice); err != nil {

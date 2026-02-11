@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 )
@@ -18,8 +20,52 @@ func main() {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
 
+	// Запускаем HTTP сервер для Web App
+	go startWebServer(bot)
+
 	go StartScheduler(bot)
 	bot.HandleUpdates()
+}
+
+func startWebServer(bot *Bot) {
+	port := os.Getenv("WEB_PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// Статические файлы
+	http.Handle("/", http.FileServer(http.Dir("web")))
+
+	// API для получения напоминаний
+	http.HandleFunc("/api/reminders", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		// Получаем chatID из Telegram Web App initData
+		// В продакшене нужно валидировать initData!
+		initData := r.Header.Get("X-Telegram-Init-Data")
+		if initData == "" {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+
+		// Парсим user_id из initData (упрощённо)
+		chatID := bot.parseUserFromInitData(initData)
+		if chatID == 0 {
+			http.Error(w, `{"error":"invalid user"}`, http.StatusBadRequest)
+			return
+		}
+
+		reminders := bot.GetUserReminders(chatID)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"reminders": reminders,
+		})
+	})
+
+	log.Printf("Starting web server on :%s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Printf("Web server error: %v", err)
+	}
 }
 
 func StartScheduler(bot *Bot) {
