@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25.2-alpine AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY *.go ./
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o scheldue-bot .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -buildvcs=false -ldflags="-s -w" -o scheldue-bot .
 
 # Final stage
 FROM alpine:3.20

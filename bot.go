@@ -14,14 +14,29 @@ import (
 
 // Reminder хранит информацию о напоминании
 type Reminder struct {
-	ID       int
-	Medicine string
-	Hour     int
-	Minute   int
+	ID         int
+	Medicine   string
+	Hour       int
+	Minute     int
+	CourseDays int // Количество дней курса (0 = бесконечно)
+	DosesTaken int // Количество отправленных напоминаний (счётчик)
 }
 
 func (r Reminder) TimeString() string {
 	return fmt.Sprintf("%02d:%02d", r.Hour, r.Minute)
+}
+
+// CourseString возвращает строку прогресса курса
+func (r Reminder) CourseString() string {
+	if r.CourseDays == 0 {
+		return fmt.Sprintf("%d/∞", r.DosesTaken)
+	}
+	return fmt.Sprintf("%d/%d", r.DosesTaken, r.CourseDays)
+}
+
+// IsCompleted проверяет, завершён ли курс
+func (r Reminder) IsCompleted() bool {
+	return r.CourseDays > 0 && r.DosesTaken >= r.CourseDays
 }
 
 // UserState определяет текущее состояние диалога
@@ -32,6 +47,8 @@ const (
 	StateWaitingMedicine
 	StateWaitingHour
 	StateWaitingMinute
+	StateWaitingCourse       // Ожидание выбора длительности курса
+	StateWaitingCustomCourse // Ожидание ввода своего количества дней
 )
 
 // User хранит информацию о пользователе
@@ -45,6 +62,7 @@ type User struct {
 	State           UserState
 	PendingMedicine string
 	PendingHour     int
+	PendingMinute   int
 	PendingMsgID    int // ID сообщения для редактирования
 }
 
@@ -136,6 +154,12 @@ func (b *Bot) HandleUpdates() {
 			continue
 		}
 
+		// Если ждём ввода своего количества дней курса
+		if state == StateWaitingCustomCourse && !update.Message.IsCommand() {
+			b.handleCustomCourseInput(update.Message)
+			continue
+		}
+
 		if update.Message.IsCommand() {
 			// Сбрасываем состояние при любой команде
 			b.mu.Lock()
@@ -205,6 +229,24 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		idStr := strings.TrimPrefix(data, "del_")
 		id, _ := strconv.Atoi(idStr)
 		b.handleDeleteReminder(chatID, callback.Message.MessageID, id)
+
+	case strings.HasPrefix(data, "course_"):
+		// Выбор длительности курса
+		courseStr := strings.TrimPrefix(data, "course_")
+		if courseStr == "custom" {
+			// Пользователь хочет ввести своё значение
+			b.mu.Lock()
+			if user, exists := b.users[chatID]; exists {
+				user.State = StateWaitingCustomCourse
+				user.PendingMsgID = callback.Message.MessageID
+			}
+			b.mu.Unlock()
+			b.deleteMessage(chatID, callback.Message.MessageID)
+			b.sendMessage(chatID, "Введи количество дней курса (число от 1 до 365):")
+		} else {
+			courseDays, _ := strconv.Atoi(courseStr)
+			b.handleCourseSelected(chatID, callback.Message.MessageID, courseDays)
+		}
 
 	case data == "cancel":
 		b.mu.Lock()
@@ -371,11 +413,67 @@ func (b *Bot) handleTimeSelected(chatID int64, messageID int, hour, minute int) 
 		return
 	}
 
+	// Сохраняем выбранное время и переходим к выбору курса
+	user.PendingHour = hour
+	user.PendingMinute = minute
+	user.State = StateWaitingCourse
+	medicine := user.PendingMedicine
+	b.mu.Unlock()
+
+	// Показываем выбор длительности курса
+	b.showCourseSelection(chatID, messageID, medicine, hour, minute)
+}
+
+func (b *Bot) showCourseSelection(chatID int64, messageID int, medicine string, hour, minute int) {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		{
+			tgbotapi.NewInlineKeyboardButtonData("7 дней", "course_7"),
+			tgbotapi.NewInlineKeyboardButtonData("14 дней", "course_14"),
+			tgbotapi.NewInlineKeyboardButtonData("21 день", "course_21"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("30 дней", "course_30"),
+			tgbotapi.NewInlineKeyboardButtonData("60 дней", "course_60"),
+			tgbotapi.NewInlineKeyboardButtonData("90 дней", "course_90"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("♾ Бесконечно", "course_0"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Ввести своё", "course_custom"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", "cancel"),
+		},
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	text := fmt.Sprintf("💊 %s\n⏰ %02d:%02d\n\nВыбери длительность курса:", medicine, hour, minute)
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ReplyMarkup = &keyboard
+	if _, err := b.api.Send(edit); err != nil {
+		log.Printf("Failed to edit message: %v", err)
+	}
+}
+
+func (b *Bot) handleCourseSelected(chatID int64, messageID int, courseDays int) {
+	b.mu.Lock()
+	user, exists := b.users[chatID]
+	if !exists || user.PendingMedicine == "" {
+		b.mu.Unlock()
+		b.deleteMessage(chatID, messageID)
+		b.sendMessage(chatID, "Ошибка. Попробуй снова: /add")
+		return
+	}
+
 	reminder := Reminder{
-		ID:       user.NextID,
-		Medicine: user.PendingMedicine,
-		Hour:     hour,
-		Minute:   minute,
+		ID:         user.NextID,
+		Medicine:   user.PendingMedicine,
+		Hour:       user.PendingHour,
+		Minute:     user.PendingMinute,
+		CourseDays: courseDays,
+		DosesTaken: 0,
 	}
 	user.NextID++
 	user.Reminders = append(user.Reminders, reminder)
@@ -386,9 +484,52 @@ func (b *Bot) handleTimeSelected(chatID int64, messageID int, hour, minute int) 
 
 	b.deleteMessage(chatID, messageID)
 
-	text := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %s\n\nИспользуй /list чтобы увидеть все напоминания",
-		reminder.Medicine, reminder.TimeString())
+	courseStr := "♾ Бесконечно"
+	if courseDays > 0 {
+		courseStr = fmt.Sprintf("%d дней", courseDays)
+	}
+
+	text := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %s\n📅 Курс: %s\n\nИспользуй /list чтобы увидеть все напоминания",
+		reminder.Medicine, reminder.TimeString(), courseStr)
 	b.sendMessage(chatID, text)
+}
+
+func (b *Bot) handleCustomCourseInput(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	text := strings.TrimSpace(msg.Text)
+
+	courseDays, err := strconv.Atoi(text)
+	if err != nil || courseDays < 1 || courseDays > 365 {
+		b.sendMessage(chatID, "Пожалуйста, введи число от 1 до 365:")
+		return
+	}
+
+	b.mu.Lock()
+	user, exists := b.users[chatID]
+	if !exists || user.PendingMedicine == "" {
+		b.mu.Unlock()
+		b.sendMessage(chatID, "Ошибка. Попробуй снова: /add")
+		return
+	}
+
+	reminder := Reminder{
+		ID:         user.NextID,
+		Medicine:   user.PendingMedicine,
+		Hour:       user.PendingHour,
+		Minute:     user.PendingMinute,
+		CourseDays: courseDays,
+		DosesTaken: 0,
+	}
+	user.NextID++
+	user.Reminders = append(user.Reminders, reminder)
+	user.PendingMedicine = ""
+	user.State = StateNone
+	user.Active = true
+	b.mu.Unlock()
+
+	resultText := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %s\n📅 Курс: %d дней\n\nИспользуй /list чтобы увидеть все напоминания",
+		reminder.Medicine, reminder.TimeString(), courseDays)
+	b.sendMessage(chatID, resultText)
 }
 
 func (b *Bot) handleList(msg *tgbotapi.Message) {
@@ -420,7 +561,7 @@ func (b *Bot) handleList(msg *tgbotapi.Message) {
 	text.WriteString("📋 Твои напоминания (часовой пояс Екатеринбург):\n\n")
 
 	for _, r := range reminders {
-		text.WriteString(fmt.Sprintf("⏰ %s — 💊 %s\n", r.TimeString(), r.Medicine))
+		text.WriteString(fmt.Sprintf("⏰ %s — 💊 %s — 📊 %s\n", r.TimeString(), r.Medicine, r.CourseString()))
 	}
 
 	// Кнопки удаления
@@ -428,7 +569,7 @@ func (b *Bot) handleList(msg *tgbotapi.Message) {
 	for _, r := range reminders {
 		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("🗑 Удалить: %s %s", r.TimeString(), r.Medicine),
+				fmt.Sprintf("🗑 %s %s [%s]", r.TimeString(), r.Medicine, r.CourseString()),
 				fmt.Sprintf("del_%d", r.ID),
 			),
 		})
@@ -473,19 +614,37 @@ func (b *Bot) handleStats(msg *tgbotapi.Message) {
 	totalUsers := len(b.users)
 	activeUsers := 0
 	totalReminders := 0
+	finiteCourses := 0    // Курсы с конечной длительностью
+	infiniteCourses := 0  // Бесконечные курсы
+	totalDosesTaken := 0  // Всего принятых доз
+	totalDosesPlanned := 0 // Всего запланированных доз (для конечных курсов)
+
 	for _, user := range b.users {
 		if user.Active {
 			activeUsers++
 		}
 		totalReminders += len(user.Reminders)
+		for _, r := range user.Reminders {
+			totalDosesTaken += r.DosesTaken
+			if r.CourseDays == 0 {
+				infiniteCourses++
+			} else {
+				finiteCourses++
+				totalDosesPlanned += r.CourseDays
+			}
+		}
 	}
 	b.mu.RUnlock()
 
 	text := fmt.Sprintf("📊 Статистика бота:\n\n"+
 		"👥 Всего пользователей: %d\n"+
-		"✅ Активных: %d\n"+
-		"💊 Всего напоминаний: %d",
-		totalUsers, activeUsers, totalReminders)
+		"✅ Активных: %d\n\n"+
+		"💊 Всего напоминаний: %d\n"+
+		"   📅 Курсов с датой окончания: %d\n"+
+		"   ♾ Бесконечных курсов: %d\n\n"+
+		"📈 Принято доз: %d\n"+
+		"📋 Запланировано доз: %d",
+		totalUsers, activeUsers, totalReminders, finiteCourses, infiniteCourses, totalDosesTaken, totalDosesPlanned)
 
 	b.sendMessage(chatID, text)
 }
@@ -556,10 +715,38 @@ func (b *Bot) GetRemindersForTime(hour, minute int) map[int64][]Reminder {
 			continue
 		}
 		for _, r := range user.Reminders {
-			if r.Hour == hour && r.Minute == minute {
+			if r.Hour == hour && r.Minute == minute && !r.IsCompleted() {
 				result[chatID] = append(result[chatID], r)
 			}
 		}
 	}
 	return result
+}
+
+// IncrementDoseTaken увеличивает счётчик принятых доз и удаляет завершённые курсы
+func (b *Bot) IncrementDoseTaken(chatID int64, reminderID int) (newCount int, total int, completed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	user, exists := b.users[chatID]
+	if !exists {
+		return 0, 0, false
+	}
+
+	for i := range user.Reminders {
+		if user.Reminders[i].ID == reminderID {
+			user.Reminders[i].DosesTaken++
+			newCount = user.Reminders[i].DosesTaken
+			total = user.Reminders[i].CourseDays
+
+			// Проверяем, завершён ли курс после инкремента
+			if user.Reminders[i].IsCompleted() {
+				completed = true
+				// Удаляем завершённое напоминание
+				user.Reminders = append(user.Reminders[:i], user.Reminders[i+1:]...)
+			}
+			return
+		}
+	}
+	return 0, 0, false
 }
