@@ -837,7 +837,8 @@ func (b *Bot) handleDonate(msg *tgbotapi.Message) {
 		Prices: []tgbotapi.LabeledPrice{
 			{Label: "Донат", Amount: 1}, // 1 звезда (минимум)
 		},
-		SuggestedTipAmounts: []int{1, 5, 10, 50}, // Предложенные суммы
+		MaxTipAmount:        100, // Максимальные чаевые
+		SuggestedTipAmounts: []int{4, 9, 49, 99}, // Предложенные суммы (+1 базовая = 5, 10, 50, 100)
 	}
 
 	if _, err := b.api.Send(invoice); err != nil {
