@@ -1,0 +1,9 @@
+services:
+  bot:
+    container_name: scheldue-bot
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Yekaterinburg
