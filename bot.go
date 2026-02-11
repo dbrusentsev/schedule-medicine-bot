@@ -92,6 +92,7 @@ func NewBot(token string) (*Bot, error) {
 		tgbotapi.BotCommand{Command: "add", Description: "Добавить напоминание"},
 		tgbotapi.BotCommand{Command: "list", Description: "Мои напоминания"},
 		tgbotapi.BotCommand{Command: "stop", Description: "Отключить напоминания"},
+		tgbotapi.BotCommand{Command: "donate", Description: "Поддержать автора"},
 		tgbotapi.BotCommand{Command: "stats", Description: "Статистика бота"},
 	)
 	if _, err := api.Request(commands); err != nil {
@@ -118,6 +119,12 @@ func (b *Bot) HandleUpdates() {
 	updates := b.api.GetUpdatesChan(u)
 
 	for update := range updates {
+		// Обработка pre-checkout запросов (для Telegram Stars)
+		if update.PreCheckoutQuery != nil {
+			b.handlePreCheckout(update.PreCheckoutQuery)
+			continue
+		}
+
 		// Обработка callback-кнопок
 		if update.CallbackQuery != nil {
 			log.Printf("[CALLBACK] user=%s (id=%d) data=%s",
@@ -129,6 +136,12 @@ func (b *Bot) HandleUpdates() {
 		}
 
 		if update.Message == nil {
+			continue
+		}
+
+		// Обработка успешного платежа
+		if update.Message.SuccessfulPayment != nil {
+			b.handleSuccessfulPayment(update.Message)
 			continue
 		}
 
@@ -177,6 +190,8 @@ func (b *Bot) HandleUpdates() {
 				b.handleList(update.Message)
 			case "stop":
 				b.handleStop(update.Message)
+			case "donate":
+				b.handleDonate(update.Message)
 			case "stats":
 				b.handleStats(update.Message)
 			}
@@ -247,6 +262,12 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 			courseDays, _ := strconv.Atoi(courseStr)
 			b.handleCourseSelected(chatID, callback.Message.MessageID, courseDays)
 		}
+
+	case strings.HasPrefix(data, "taken_"):
+		// Подтверждение приёма лекарства
+		idStr := strings.TrimPrefix(data, "taken_")
+		id, _ := strconv.Atoi(idStr)
+		b.handleTakenConfirm(chatID, callback.Message.MessageID, id)
 
 	case data == "cancel":
 		b.mu.Lock()
@@ -704,6 +725,53 @@ func (b *Bot) deleteMessage(chatID int64, messageID int) {
 	}
 }
 
+// sendReminderWithButton отправляет напоминание с кнопкой "Принял"
+func (b *Bot) sendReminderWithButton(chatID int64, text string, reminderID int) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Принял", fmt.Sprintf("taken_%d", reminderID)),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send reminder to %d: %v", chatID, err)
+	}
+}
+
+// handleTakenConfirm обрабатывает подтверждение приёма лекарства
+func (b *Bot) handleTakenConfirm(chatID int64, messageID int, reminderID int) {
+	// Инкрементируем счётчик
+	medicineName, newCount, total, completed := b.IncrementDoseTaken(chatID, reminderID)
+
+	if medicineName == "" {
+		// Напоминание не найдено (возможно уже удалено)
+		b.deleteMessage(chatID, messageID)
+		return
+	}
+
+	// Формируем строку прогресса
+	var progressStr string
+	if total == 0 {
+		progressStr = fmt.Sprintf("%d/∞", newCount)
+	} else {
+		progressStr = fmt.Sprintf("%d/%d", newCount, total)
+	}
+
+	// Обновляем сообщение — убираем кнопку, показываем подтверждение
+	text := fmt.Sprintf("✅ Принято: 💊 %s\n📊 Приём: %s", medicineName, progressStr)
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	if _, err := b.api.Send(edit); err != nil {
+		log.Printf("Failed to edit message: %v", err)
+	}
+
+	// Если курс завершён, отправляем поздравление
+	if completed {
+		b.sendMessage(chatID, fmt.Sprintf("🎉 Курс \"%s\" завершён! Ты молодец!", medicineName))
+	}
+}
+
 // GetRemindersForTime возвращает список напоминаний для указанного времени
 func (b *Bot) GetRemindersForTime(hour, minute int) map[int64][]Reminder {
 	b.mu.RLock()
@@ -724,18 +792,19 @@ func (b *Bot) GetRemindersForTime(hour, minute int) map[int64][]Reminder {
 }
 
 // IncrementDoseTaken увеличивает счётчик принятых доз и удаляет завершённые курсы
-func (b *Bot) IncrementDoseTaken(chatID int64, reminderID int) (newCount int, total int, completed bool) {
+func (b *Bot) IncrementDoseTaken(chatID int64, reminderID int) (medicineName string, newCount int, total int, completed bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	user, exists := b.users[chatID]
 	if !exists {
-		return 0, 0, false
+		return "", 0, 0, false
 	}
 
 	for i := range user.Reminders {
 		if user.Reminders[i].ID == reminderID {
 			user.Reminders[i].DosesTaken++
+			medicineName = user.Reminders[i].Medicine
 			newCount = user.Reminders[i].DosesTaken
 			total = user.Reminders[i].CourseDays
 
@@ -748,5 +817,68 @@ func (b *Bot) IncrementDoseTaken(chatID int64, reminderID int) (newCount int, to
 			return
 		}
 	}
-	return 0, 0, false
+	return "", 0, 0, false
+}
+
+// handleDonate отправляет инвойс для доната через Telegram Stars
+func (b *Bot) handleDonate(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+
+	// Создаём инвойс для Telegram Stars
+	invoice := tgbotapi.InvoiceConfig{
+		BaseChat: tgbotapi.BaseChat{
+			ChatID: chatID,
+		},
+		Title:         "Поддержать автора",
+		Description:   "Спасибо за поддержку! Ваш донат помогает развивать бота 💊",
+		Payload:       "donate_stars",
+		ProviderToken: "", // Пустой токен для Telegram Stars
+		Currency:      "XTR", // Валюта Telegram Stars
+		Prices: []tgbotapi.LabeledPrice{
+			{Label: "Донат", Amount: 1}, // 1 звезда (минимум)
+		},
+		SuggestedTipAmounts: []int{1, 5, 10, 50}, // Предложенные суммы
+	}
+
+	if _, err := b.api.Send(invoice); err != nil {
+		log.Printf("Failed to send invoice: %v", err)
+		b.sendMessage(chatID, "Не удалось создать платёж. Попробуй позже.")
+	}
+}
+
+// handlePreCheckout подтверждает pre-checkout запрос
+func (b *Bot) handlePreCheckout(query *tgbotapi.PreCheckoutQuery) {
+	log.Printf("[PRECHECKOUT] user=%s amount=%d %s",
+		query.From.UserName, query.TotalAmount, query.Currency)
+
+	// Подтверждаем платёж
+	callback := tgbotapi.PreCheckoutConfig{
+		PreCheckoutQueryID: query.ID,
+		OK:                 true,
+	}
+
+	if _, err := b.api.Request(callback); err != nil {
+		log.Printf("Failed to answer pre-checkout: %v", err)
+	}
+}
+
+// handleSuccessfulPayment обрабатывает успешный платёж
+func (b *Bot) handleSuccessfulPayment(msg *tgbotapi.Message) {
+	payment := msg.SuccessfulPayment
+	log.Printf("[PAYMENT] user=%d amount=%d %s",
+		msg.Chat.ID, payment.TotalAmount, payment.Currency)
+
+	text := fmt.Sprintf("🎉 Спасибо за поддержку!\n\n"+
+		"Получено: %d ⭐\n\n"+
+		"Твоя поддержка очень важна для развития бота!",
+		payment.TotalAmount)
+
+	b.sendMessage(msg.Chat.ID, text)
+
+	// Уведомляем админа о донате
+	if b.adminID != 0 && msg.Chat.ID != b.adminID {
+		adminText := fmt.Sprintf("💰 Новый донат!\n\nОт: @%s (ID: %d)\nСумма: %d ⭐",
+			msg.From.UserName, msg.Chat.ID, payment.TotalAmount)
+		b.sendMessage(b.adminID, adminText)
+	}
 }

@@ -61,24 +61,8 @@ func StartScheduler(bot *Bot) {
 
 		for chatID, userReminders := range reminders {
 			for _, r := range userReminders {
-				// Сначала инкрементируем счётчик
-				newCount, total, completed := bot.IncrementDoseTaken(chatID, r.ID)
-
-				// Формируем строку прогресса
-				var progressStr string
-				if total == 0 {
-					progressStr = fmt.Sprintf("%d/∞", newCount)
-				} else {
-					progressStr = fmt.Sprintf("%d/%d", newCount, total)
-				}
-
-				text := fmt.Sprintf("⏰ Время принять: 💊 %s\n📊 Приём: %s", r.Medicine, progressStr)
-				bot.sendMessage(chatID, text)
-
-				// Если курс завершён, отправляем поздравление
-				if completed {
-					bot.sendMessage(chatID, fmt.Sprintf("🎉 Курс \"%s\" завершён! Ты молодец!", r.Medicine))
-				}
+				text := fmt.Sprintf("⏰ Время принять: 💊 %s\n📊 Приём: %s", r.Medicine, r.CourseString())
+				bot.sendReminderWithButton(chatID, text, r.ID)
 			}
 		}
 	}
