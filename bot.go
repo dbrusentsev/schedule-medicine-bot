@@ -235,6 +235,10 @@ func (b *Bot) HandleUpdates() {
 			b.handleStop(update.Message)
 		case strings.Contains(text, "Включить"):
 			b.handleStart(update.Message)
+		case strings.Contains(text, "Статистика"):
+			b.handleStats(update.Message)
+		case strings.Contains(text, "Рассылка"):
+			b.handleNotifyPrompt(update.Message)
 		case strings.ToLower(text) == "привет":
 			b.sendMessage(chatID, "Привет! Я бот для напоминаний о лекарствах. Используй /start чтобы начать.")
 		}
@@ -326,7 +330,7 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 		"/add — добавить напоминание\n" +
 		"/list — список напоминаний"
 
-	keyboard := b.getMainKeyboard(true)
+	keyboard := b.getMainKeyboard(chatID, true)
 
 	reply := tgbotapi.NewMessage(chatID, text)
 	reply.ReplyMarkup = keyboard
@@ -674,7 +678,7 @@ func (b *Bot) handleStop(msg *tgbotapi.Message) {
 		log.Printf("Failed to deactivate user %d: %v", chatID, err)
 	}
 
-	keyboard := b.getMainKeyboard(false)
+	keyboard := b.getMainKeyboard(chatID, false)
 
 	reply := tgbotapi.NewMessage(chatID, "⏸ Напоминания отключены.\n\nТвои настройки сохранены.")
 	reply.ReplyMarkup = keyboard
@@ -683,26 +687,35 @@ func (b *Bot) handleStop(msg *tgbotapi.Message) {
 	}
 }
 
-func (b *Bot) getMainKeyboard(active bool) tgbotapi.ReplyKeyboardMarkup {
-	var keyboard tgbotapi.ReplyKeyboardMarkup
+func (b *Bot) getMainKeyboard(chatID int64, active bool) tgbotapi.ReplyKeyboardMarkup {
+	var rows [][]tgbotapi.KeyboardButton
+
 	if active {
-		keyboard = tgbotapi.NewReplyKeyboard(
-			tgbotapi.NewKeyboardButtonRow(
-				tgbotapi.NewKeyboardButton("➕ Добавить"),
-				tgbotapi.NewKeyboardButton("📋 Мои напоминания"),
-			),
-			tgbotapi.NewKeyboardButtonRow(
-				tgbotapi.NewKeyboardButton("⏸ Отключить"),
-			),
-		)
+		rows = append(rows, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("➕ Добавить"),
+			tgbotapi.NewKeyboardButton("📋 Мои напоминания"),
+		))
+		rows = append(rows, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("⏸ Отключить"),
+		))
 	} else {
-		keyboard = tgbotapi.NewReplyKeyboard(
-			tgbotapi.NewKeyboardButtonRow(
-				tgbotapi.NewKeyboardButton("▶️ Включить"),
-			),
-		)
+		rows = append(rows, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("▶️ Включить"),
+		))
 	}
-	keyboard.ResizeKeyboard = true
+
+	// Кнопки админа
+	if b.adminID != 0 && chatID == b.adminID {
+		rows = append(rows, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("📊 Статистика"),
+			tgbotapi.NewKeyboardButton("📣 Рассылка"),
+		))
+	}
+
+	keyboard := tgbotapi.ReplyKeyboardMarkup{
+		Keyboard:       rows,
+		ResizeKeyboard: true,
+	}
 	return keyboard
 }
 
@@ -962,6 +975,18 @@ func (b *Bot) handleNotify(msg *tgbotapi.Message) {
 	}
 
 	b.sendMessage(chatID, fmt.Sprintf("Уведомление отправлено %d из %d пользователей", sentCount, len(chatIDs)))
+}
+
+// handleNotifyPrompt показывает подсказку для рассылки
+func (b *Bot) handleNotifyPrompt(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+
+	if b.adminID == 0 || chatID != b.adminID {
+		b.sendMessage(chatID, "Эта команда доступна только администратору")
+		return
+	}
+
+	b.sendMessage(chatID, "📣 Рассылка сообщений\n\nОтправь команду:\n/notify Текст сообщения\n\nПример:\n/notify Обновление бота! Добавлены новые функции.")
 }
 
 // sendMessageWithError отправляет сообщение и возвращает ошибку
