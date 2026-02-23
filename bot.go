@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,14 +67,24 @@ type User struct {
 	PendingMsgID    int // ID сообщения для редактирования
 }
 
+// PendingReminder хранит временное состояние создания напоминания
+type PendingReminder struct {
+	State    UserState
+	Medicine string
+	Hour     int
+	Minute   int
+	MsgID    int
+}
+
 type Bot struct {
 	api     *tgbotapi.BotAPI
-	users   map[int64]*User
+	storage *Storage
+	pending map[int64]*PendingReminder // временные состояния диалогов
 	mu      sync.RWMutex
 	adminID int64
 }
 
-func NewBot(token string) (*Bot, error) {
+func NewBot(token string, storage *Storage) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bot: %w", err)
@@ -123,7 +132,8 @@ func NewBot(token string) (*Bot, error) {
 
 	return &Bot{
 		api:     api,
-		users:   make(map[int64]*User),
+		storage: storage,
+		pending: make(map[int64]*PendingReminder),
 		adminID: adminID,
 	}, nil
 }
@@ -168,12 +178,12 @@ func (b *Bot) HandleUpdates() {
 		}
 		log.Printf("[MSG] user=%s (id=%d) text=%q", userName, chatID, update.Message.Text)
 
-		// Проверяем состояние пользователя
+		// Проверяем состояние пользователя (из pending map)
 		b.mu.RLock()
-		user, exists := b.users[chatID]
+		pending := b.pending[chatID]
 		state := StateNone
-		if exists {
-			state = user.State
+		if pending != nil {
+			state = pending.State
 		}
 		b.mu.RUnlock()
 
@@ -192,9 +202,7 @@ func (b *Bot) HandleUpdates() {
 		if update.Message.IsCommand() {
 			// Сбрасываем состояние при любой команде
 			b.mu.Lock()
-			if user, exists := b.users[chatID]; exists {
-				user.State = StateNone
-			}
+			delete(b.pending, chatID)
 			b.mu.Unlock()
 
 			switch update.Message.Command() {
@@ -210,6 +218,8 @@ func (b *Bot) HandleUpdates() {
 				b.handleDonate(update.Message)
 			case "stats":
 				b.handleStats(update.Message)
+			case "notify":
+				b.handleNotify(update.Message)
 			}
 			continue
 		}
@@ -267,9 +277,9 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		if courseStr == "custom" {
 			// Пользователь хочет ввести своё значение
 			b.mu.Lock()
-			if user, exists := b.users[chatID]; exists {
-				user.State = StateWaitingCustomCourse
-				user.PendingMsgID = callback.Message.MessageID
+			if p := b.pending[chatID]; p != nil {
+				p.State = StateWaitingCustomCourse
+				p.MsgID = callback.Message.MessageID
 			}
 			b.mu.Unlock()
 			b.deleteMessage(chatID, callback.Message.MessageID)
@@ -294,9 +304,7 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 
 	case data == "cancel":
 		b.mu.Lock()
-		if user, exists := b.users[chatID]; exists {
-			user.State = StateNone
-		}
+		delete(b.pending, chatID)
 		b.mu.Unlock()
 		b.deleteMessage(chatID, callback.Message.MessageID)
 		b.sendMessage(chatID, "Отменено")
@@ -306,13 +314,12 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 func (b *Bot) handleStart(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
-	b.mu.Lock()
-	if _, exists := b.users[chatID]; !exists {
-		b.users[chatID] = &User{ChatID: chatID, Active: true, NextID: 1}
-	} else {
-		b.users[chatID].Active = true
+	if _, err := b.storage.GetOrCreateUser(chatID); err != nil {
+		log.Printf("Failed to create user %d: %v", chatID, err)
 	}
-	b.mu.Unlock()
+	if err := b.storage.SetUserActive(chatID, true); err != nil {
+		log.Printf("Failed to set user active %d: %v", chatID, err)
+	}
 
 	text := "Привет! Я помогу тебе не забывать принимать лекарства.\n\n" +
 		"Используй кнопки ниже или команды:\n" +
@@ -331,12 +338,12 @@ func (b *Bot) handleStart(msg *tgbotapi.Message) {
 func (b *Bot) handleAdd(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
-	b.mu.Lock()
-	if _, exists := b.users[chatID]; !exists {
-		b.users[chatID] = &User{ChatID: chatID, Active: true, NextID: 1}
+	if _, err := b.storage.GetOrCreateUser(chatID); err != nil {
+		log.Printf("Failed to create user %d: %v", chatID, err)
 	}
-	b.users[chatID].State = StateWaitingMedicine
-	b.users[chatID].PendingMedicine = ""
+
+	b.mu.Lock()
+	b.pending[chatID] = &PendingReminder{State: StateWaitingMedicine}
 	b.mu.Unlock()
 
 	// Просим ввести название лекарства
@@ -363,9 +370,10 @@ func (b *Bot) handleMedicineInput(msg *tgbotapi.Message) {
 	}
 
 	b.mu.Lock()
-	user := b.users[chatID]
-	user.PendingMedicine = medicine
-	user.State = StateWaitingHour
+	if p := b.pending[chatID]; p != nil {
+		p.Medicine = medicine
+		p.State = StateWaitingHour
+	}
 	b.mu.Unlock()
 
 	// Показываем выбор часа
@@ -411,16 +419,16 @@ func (b *Bot) showHourSelection(chatID int64, medicine string) {
 
 func (b *Bot) handleHourSelected(chatID int64, messageID int, hour int) {
 	b.mu.Lock()
-	user, exists := b.users[chatID]
-	if !exists || user.PendingMedicine == "" {
+	p := b.pending[chatID]
+	if p == nil || p.Medicine == "" {
 		b.mu.Unlock()
 		b.deleteMessage(chatID, messageID)
 		b.sendMessage(chatID, "Ошибка. Попробуй снова: /add")
 		return
 	}
-	medicine := user.PendingMedicine
-	user.PendingHour = hour
-	user.State = StateWaitingMinute
+	medicine := p.Medicine
+	p.Hour = hour
+	p.State = StateWaitingMinute
 	b.mu.Unlock()
 
 	// Показываем выбор минут
@@ -449,8 +457,8 @@ func (b *Bot) handleHourSelected(chatID int64, messageID int, hour int) {
 
 func (b *Bot) handleTimeSelected(chatID int64, messageID int, hour, minute int) {
 	b.mu.Lock()
-	user, exists := b.users[chatID]
-	if !exists || user.PendingMedicine == "" {
+	p := b.pending[chatID]
+	if p == nil || p.Medicine == "" {
 		b.mu.Unlock()
 		b.deleteMessage(chatID, messageID)
 		b.sendMessage(chatID, "Ошибка. Попробуй снова: /add")
@@ -458,10 +466,10 @@ func (b *Bot) handleTimeSelected(chatID int64, messageID int, hour, minute int) 
 	}
 
 	// Сохраняем выбранное время и переходим к выбору курса
-	user.PendingHour = hour
-	user.PendingMinute = minute
-	user.State = StateWaitingCourse
-	medicine := user.PendingMedicine
+	p.Hour = hour
+	p.Minute = minute
+	p.State = StateWaitingCourse
+	medicine := p.Medicine
 	b.mu.Unlock()
 
 	// Показываем выбор длительности курса
@@ -503,29 +511,29 @@ func (b *Bot) showCourseSelection(chatID int64, messageID int, medicine string, 
 
 func (b *Bot) handleCourseSelected(chatID int64, messageID int, courseDays int) {
 	b.mu.Lock()
-	user, exists := b.users[chatID]
-	if !exists || user.PendingMedicine == "" {
+	p := b.pending[chatID]
+	if p == nil || p.Medicine == "" {
 		b.mu.Unlock()
 		b.deleteMessage(chatID, messageID)
 		b.sendMessage(chatID, "Ошибка. Попробуй снова: /add")
 		return
 	}
 
-	reminder := Reminder{
-		ID:         user.NextID,
-		Medicine:   user.PendingMedicine,
-		Hour:       user.PendingHour,
-		Minute:     user.PendingMinute,
-		CourseDays: courseDays,
-		DosesTaken: 0,
-	}
-	user.NextID++
-	user.Reminders = append(user.Reminders, reminder)
-	user.PendingMedicine = ""
-	user.State = StateNone
-	user.Active = true
+	medicine := p.Medicine
+	hour := p.Hour
+	minute := p.Minute
+	delete(b.pending, chatID)
 	b.mu.Unlock()
 
+	// Сохраняем в БД
+	_, err := b.storage.AddReminder(chatID, medicine, hour, minute, courseDays)
+	if err != nil {
+		log.Printf("Failed to add reminder: %v", err)
+		b.sendMessage(chatID, "Ошибка сохранения. Попробуй снова: /add")
+		return
+	}
+
+	b.storage.SetUserActive(chatID, true)
 	b.deleteMessage(chatID, messageID)
 
 	courseStr := "♾ Бесконечно"
@@ -533,8 +541,8 @@ func (b *Bot) handleCourseSelected(chatID int64, messageID int, courseDays int) 
 		courseStr = fmt.Sprintf("%d дней", courseDays)
 	}
 
-	text := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %s\n📅 Курс: %s\n\nИспользуй /list чтобы увидеть все напоминания",
-		reminder.Medicine, reminder.TimeString(), courseStr)
+	text := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %02d:%02d\n📅 Курс: %s\n\nИспользуй /list чтобы увидеть все напоминания",
+		medicine, hour, minute, courseStr)
 	b.sendMessage(chatID, text)
 }
 
@@ -549,57 +557,50 @@ func (b *Bot) handleCustomCourseInput(msg *tgbotapi.Message) {
 	}
 
 	b.mu.Lock()
-	user, exists := b.users[chatID]
-	if !exists || user.PendingMedicine == "" {
+	p := b.pending[chatID]
+	if p == nil || p.Medicine == "" {
 		b.mu.Unlock()
 		b.sendMessage(chatID, "Ошибка. Попробуй снова: /add")
 		return
 	}
 
-	reminder := Reminder{
-		ID:         user.NextID,
-		Medicine:   user.PendingMedicine,
-		Hour:       user.PendingHour,
-		Minute:     user.PendingMinute,
-		CourseDays: courseDays,
-		DosesTaken: 0,
-	}
-	user.NextID++
-	user.Reminders = append(user.Reminders, reminder)
-	user.PendingMedicine = ""
-	user.State = StateNone
-	user.Active = true
+	medicine := p.Medicine
+	hour := p.Hour
+	minute := p.Minute
+	delete(b.pending, chatID)
 	b.mu.Unlock()
 
-	resultText := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %s\n📅 Курс: %d дней\n\nИспользуй /list чтобы увидеть все напоминания",
-		reminder.Medicine, reminder.TimeString(), courseDays)
+	// Сохраняем в БД
+	_, err = b.storage.AddReminder(chatID, medicine, hour, minute, courseDays)
+	if err != nil {
+		log.Printf("Failed to add reminder: %v", err)
+		b.sendMessage(chatID, "Ошибка сохранения. Попробуй снова: /add")
+		return
+	}
+
+	b.storage.SetUserActive(chatID, true)
+
+	resultText := fmt.Sprintf("✅ Напоминание добавлено!\n\n💊 %s\n⏰ %02d:%02d\n📅 Курс: %d дней\n\nИспользуй /list чтобы увидеть все напоминания",
+		medicine, hour, minute, courseDays)
 	b.sendMessage(chatID, resultText)
 }
 
 func (b *Bot) handleList(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
-	b.mu.RLock()
-	user, exists := b.users[chatID]
-	var reminders []Reminder
-	if exists {
-		reminders = make([]Reminder, len(user.Reminders))
-		copy(reminders, user.Reminders)
+	reminders, err := b.storage.GetReminders(chatID)
+	if err != nil {
+		log.Printf("Failed to get reminders: %v", err)
+		b.sendMessage(chatID, "Ошибка загрузки напоминаний")
+		return
 	}
-	b.mu.RUnlock()
 
-	if !exists || len(reminders) == 0 {
+	if len(reminders) == 0 {
 		b.sendMessage(chatID, "У тебя пока нет напоминаний.\n\nИспользуй /add чтобы добавить")
 		return
 	}
 
-	// Сортируем по времени
-	sort.Slice(reminders, func(i, j int) bool {
-		if reminders[i].Hour != reminders[j].Hour {
-			return reminders[i].Hour < reminders[j].Hour
-		}
-		return reminders[i].Minute < reminders[j].Minute
-	})
+	// Уже отсортированы в storage.GetReminders
 
 	var text strings.Builder
 	text.WriteString("📋 Твои напоминания (часовой пояс Екатеринбург):\n\n")
@@ -629,17 +630,9 @@ func (b *Bot) handleList(msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleDeleteReminder(chatID int64, messageID int, reminderID int) {
-	b.mu.Lock()
-	user, exists := b.users[chatID]
-	if exists {
-		for i, r := range user.Reminders {
-			if r.ID == reminderID {
-				user.Reminders = append(user.Reminders[:i], user.Reminders[i+1:]...)
-				break
-			}
-		}
+	if err := b.storage.DeleteReminder(chatID, reminderID); err != nil {
+		log.Printf("Failed to delete reminder: %v", err)
 	}
-	b.mu.Unlock()
 
 	b.deleteMessage(chatID, messageID)
 	b.sendMessage(chatID, "🗑 Напоминание удалено")
@@ -654,31 +647,12 @@ func (b *Bot) handleStats(msg *tgbotapi.Message) {
 		return
 	}
 
-	b.mu.RLock()
-	totalUsers := len(b.users)
-	activeUsers := 0
-	totalReminders := 0
-	finiteCourses := 0    // Курсы с конечной длительностью
-	infiniteCourses := 0  // Бесконечные курсы
-	totalDosesTaken := 0  // Всего принятых доз
-	totalDosesPlanned := 0 // Всего запланированных доз (для конечных курсов)
-
-	for _, user := range b.users {
-		if user.Active {
-			activeUsers++
-		}
-		totalReminders += len(user.Reminders)
-		for _, r := range user.Reminders {
-			totalDosesTaken += r.DosesTaken
-			if r.CourseDays == 0 {
-				infiniteCourses++
-			} else {
-				finiteCourses++
-				totalDosesPlanned += r.CourseDays
-			}
-		}
+	totalUsers, activeUsers, totalReminders, finiteCourses, infiniteCourses, totalDosesTaken, totalDosesPlanned, err := b.storage.GetStats()
+	if err != nil {
+		log.Printf("Failed to get stats: %v", err)
+		b.sendMessage(chatID, "Ошибка загрузки статистики")
+		return
 	}
-	b.mu.RUnlock()
 
 	text := fmt.Sprintf("📊 Статистика бота:\n\n"+
 		"👥 Всего пользователей: %d\n"+
@@ -696,11 +670,9 @@ func (b *Bot) handleStats(msg *tgbotapi.Message) {
 func (b *Bot) handleStop(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
-	b.mu.Lock()
-	if user, ok := b.users[chatID]; ok {
-		user.Active = false
+	if err := b.storage.SetUserActive(chatID, false); err != nil {
+		log.Printf("Failed to deactivate user %d: %v", chatID, err)
 	}
-	b.mu.Unlock()
 
 	keyboard := b.getMainKeyboard(false)
 
@@ -806,16 +778,14 @@ type ReminderJSON struct {
 
 // GetUserReminders возвращает напоминания пользователя для API
 func (b *Bot) GetUserReminders(chatID int64) []ReminderJSON {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	user, exists := b.users[chatID]
-	if !exists {
+	reminders, err := b.storage.GetReminders(chatID)
+	if err != nil {
+		log.Printf("Failed to get reminders for API: %v", err)
 		return []ReminderJSON{}
 	}
 
-	result := make([]ReminderJSON, len(user.Reminders))
-	for i, r := range user.Reminders {
+	result := make([]ReminderJSON, len(reminders))
+	for i, r := range reminders {
 		result[i] = ReminderJSON{
 			ID:         r.ID,
 			Medicine:   r.Medicine,
@@ -861,50 +831,22 @@ func (b *Bot) parseUserFromInitData(initData string) int64 {
 
 // GetRemindersForTime возвращает список напоминаний для указанного времени
 func (b *Bot) GetRemindersForTime(hour, minute int) map[int64][]Reminder {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	result := make(map[int64][]Reminder)
-	for chatID, user := range b.users {
-		if !user.Active {
-			continue
-		}
-		for _, r := range user.Reminders {
-			if r.Hour == hour && r.Minute == minute && !r.IsCompleted() {
-				result[chatID] = append(result[chatID], r)
-			}
-		}
+	result, err := b.storage.GetRemindersForTime(hour, minute)
+	if err != nil {
+		log.Printf("Failed to get reminders for time: %v", err)
+		return make(map[int64][]Reminder)
 	}
 	return result
 }
 
 // IncrementDoseTaken увеличивает счётчик принятых доз и удаляет завершённые курсы
 func (b *Bot) IncrementDoseTaken(chatID int64, reminderID int) (medicineName string, newCount int, total int, completed bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	user, exists := b.users[chatID]
-	if !exists {
+	medicineName, newCount, total, completed, err := b.storage.IncrementDoseTaken(chatID, reminderID)
+	if err != nil {
+		log.Printf("Failed to increment dose: %v", err)
 		return "", 0, 0, false
 	}
-
-	for i := range user.Reminders {
-		if user.Reminders[i].ID == reminderID {
-			user.Reminders[i].DosesTaken++
-			medicineName = user.Reminders[i].Medicine
-			newCount = user.Reminders[i].DosesTaken
-			total = user.Reminders[i].CourseDays
-
-			// Проверяем, завершён ли курс после инкремента
-			if user.Reminders[i].IsCompleted() {
-				completed = true
-				// Удаляем завершённое напоминание
-				user.Reminders = append(user.Reminders[:i], user.Reminders[i+1:]...)
-			}
-			return
-		}
-	}
-	return "", 0, 0, false
+	return medicineName, newCount, total, completed
 }
 
 // handleDonate отправляет меню выбора суммы доната
@@ -987,4 +929,47 @@ func (b *Bot) handleSuccessfulPayment(msg *tgbotapi.Message) {
 			msg.From.UserName, msg.Chat.ID, payment.TotalAmount)
 		b.sendMessage(b.adminID, adminText)
 	}
+}
+
+// handleNotify отправляет уведомление всем пользователям (только для админа)
+func (b *Bot) handleNotify(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+
+	// Проверка прав администратора
+	if b.adminID == 0 || chatID != b.adminID {
+		b.sendMessage(chatID, "Эта команда доступна только администратору")
+		return
+	}
+
+	// Получаем текст после команды
+	text := strings.TrimSpace(strings.TrimPrefix(msg.Text, "/notify"))
+	if text == "" {
+		text = "Важное уведомление от бота!"
+	}
+
+	chatIDs, err := b.storage.GetAllUsers()
+	if err != nil {
+		log.Printf("Failed to get users for notify: %v", err)
+		b.sendMessage(chatID, "Ошибка получения списка пользователей")
+		return
+	}
+
+	sentCount := 0
+	for _, id := range chatIDs {
+		if err := b.sendMessageWithError(id, text); err == nil {
+			sentCount++
+		}
+	}
+
+	b.sendMessage(chatID, fmt.Sprintf("Уведомление отправлено %d из %d пользователей", sentCount, len(chatIDs)))
+}
+
+// sendMessageWithError отправляет сообщение и возвращает ошибку
+func (b *Bot) sendMessageWithError(chatID int64, text string) error {
+	msg := tgbotapi.NewMessage(chatID, text)
+	_, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("Failed to send message to %d: %v", chatID, err)
+	}
+	return err
 }

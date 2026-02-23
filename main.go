@@ -15,7 +15,18 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN is not set")
 	}
 
-	bot, err := NewBot(token)
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is not set")
+	}
+
+	storage, err := NewStorage(databaseURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer storage.Close()
+
+	bot, err := NewBot(token, storage)
 	if err != nil {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
